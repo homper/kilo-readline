@@ -1,0 +1,21 @@
+{
+  "name": "kilo-readline",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "build": "tsc",
+    "test": "tsx --test test/*.test.ts",
+    "install:bin": "bash scripts/install-bin.sh",
+    "uninstall:bin": "bash scripts/uninstall-bin.sh"
+  },
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^1.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "tsx": "^4.7.0",
+    "typescript": "^5.6.0"
+  }
+}
