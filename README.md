@@ -1,0 +1,218 @@
+# kilo-readline
+
+> **Disclaimer:** may contain traces of llms, use carefully.
+
+This is a simple readline-style way to run kilo. Without a TUI. It is a terminal
+client that talks to the `kilo acp` agent over the Agent Client Protocol (ACP),
+using Node's `@agentclientprotocol/sdk`.
+
+Instead of kilo's full terminal UI, this client drives the agent from a plain
+readline-style prompt (`kilo> `). It spawns a `kilo acp` child process, opens an
+ACP session, and renders model output, tool calls, diffs, tables, and thinking
+summaries as colored text directly in the terminal.
+
+Features:
+
+- Custom raw-mode line editor (`src/rawinput.ts`) with multi-line input,
+  history navigation, incremental Ctrl+R search, and tab completion of slash
+  commands. History is persisted in `.kilo/history`.
+- Bracketed-paste handling (`src/paste.ts`) so pasted text is distinguished
+  from typed keystrokes and dropped during output or permission prompts.
+- Streaming rendering of tool calls: per-kind icons, what-it-is-doing line
+  (file path, command, pattern, ...), compact status transitions, search
+  output grouping, and inline diffs for edits.
+- Markdown rendering for the agent's responses: headers, bold/italic/
+  underline, inline code, and column-width-aware tables that wrap to the
+  terminal width.
+- Permission prompts answered inline via typed digits or `c` to cancel.
+- Best-effort thinking summarization: a second `kilo acp` subagent running a
+  small/free model periodically summarizes the agent's reasoning blocks so long
+  thinking shows progress instead of a silent line. Tunable via
+  `KILO_THINK_SUMMARY_*` env vars and falls back to a stats line if unavailable.
+- Ctrl+C cancels the current turn (and the underlying ACP request) instead of
+  killing the client; a second Ctrl+C at an empty prompt exits.
+
+## Requirements
+
+- Node.js
+- The `kilo` CLI on PATH (used as the agent process). Install it from
+  https://kilo.ai (see https://kilo.ai/docs for setup). The agent command and
+  args can be overridden with `KILO_AGENT_CMD` and `KILO_AGENT_ARGS`
+  (defaults: `kilo acp`).
+- A kilo config with an AI provider, e.g. `~/.config/kilo/kilo.jsonc`. You need
+  to set a `small_model` (used by the thinking summarizer; falls back to
+  `kilo/kilo-auto/free`). A minimal providers/models section looks like:
+
+  ```jsonc
+  // ~/.config/kilo/kilo.jsonc
+  "provider": {
+    "openrouter": {
+      "apiKey": "{env:OPENROUTER_API_KEY}",
+      "options": { "stream": false, "disableStreaming": true },
+      "models": {
+        "z-ai/glm-5.2": {
+          "options": {
+            "stream": false,
+            "disableStreaming": true,
+            "provider": {
+              "order": ["decart", "streamlake", "novita"],
+              "allow_fallbacks": true
+            }
+          }
+        }
+      }
+    }
+  },
+  "model": "openrouter/z-ai/glm-5.2",
+  "small_model": "kilo/kilo-auto/free",
+  "agent": {
+    "code":     { "model": "openrouter/z-ai/glm-5.2", "options": { "stream": false, "disableStreaming": true } },
+    "explore":  { "model": "openrouter/z-ai/glm-5.2", "options": { "stream": false, "disableStreaming": true } },
+    "general":  { "model": "openrouter/z-ai/glm-5.2", "options": { "stream": false, "disableStreaming": true } },
+    "ask":      { "model": "openrouter/z-ai/glm-5.2", "options": { "stream": false, "disableStreaming": true } }
+  }
+
+  // Alternatively, deepseek works well too:
+  // "model": "openrouter/deepseek/deepseek-v4-pro",
+  // "small_model": "openrouter/deepseek/deepseek-v4-flash",
+  // "agent": {
+  //   "code":    { "model": "openrouter/deepseek/deepseek-v4-pro" },
+  //   "explore": { "model": "openrouter/deepseek/deepseek-v4-pro" },
+  //   "general": { "model": "openrouter/deepseek/deepseek-v4-pro" },
+  //   "ask":     { "model": "openrouter/deepseek/deepseek-v4-pro" }
+  // }
+  ```
+
+  These two models — deepseek and glm — are the cheapest good models at the
+  moment, but this is just a recommendation; any provider/model kilo supports
+  works. deepseek is slightly worse than glm, but better than free models for
+  writing the basic structure of a project and good for non-complex tasks (half
+  of this tool was written with deepseek).
+
+## Usage
+
+Install dependencies and run in development:
+
+```
+npm install
+npm run dev
+```
+
+Build and run the compiled client:
+
+```
+npm run build
+npm start
+```
+
+Or install it as a `kilo-readline` launcher next to the `kilo` binary:
+
+```
+npm run install:bin
+kilo-readline
+```
+
+Remove it again with `npm run uninstall:bin`.
+
+### Flags
+
+- `-c`, `--continue` — resume the most recent session (requires the agent to
+  advertise the `loadSession` capability; the resumed id is stored in
+  `.kilo/last_session`).
+- `-s <id>`, `--session <id>` — resume a specific session by id (also requires
+  `loadSession`). If resume fails or the capability is missing, a new session is
+  started instead and a warning is printed. The replayed conversation history
+  is drained silently (the last `usage_update` is recorded for `/status`).
+
+### Notable environment variables
+
+- `KILO_AGENT_CMD` / `KILO_AGENT_ARGS` — override the spawned agent command.
+- `KILO_THINK_SUMMARY_MODEL` — small model used for thinking summaries
+  (defaults to `kilo/kilo-auto/free`, or the config's `small_model`).
+- `KILO_THINK_SUMMARY_*` — timing/size tuning knobs for the summarizer.
+
+## Local permissions
+
+When a permission prompt is shown, the client adds an extra option beyond the
+agent's:
+
+- **Always allow \<tool\> locally** — writes the rule to the project-local
+  `<cwd>/.kilo/kilo.jsonc` (kilo's own native project config) and remembers it
+  for the current session.
+
+The current tool call proceeds as *allow once* (the agent persists nothing
+globally), and the saved rule then:
+
+- **this session**: auto-approves identical calls without re-prompting (the
+  client keeps an in-memory allow-set; the agent has no project-config watcher
+  and `allow_once` doesn't seed its in-memory allow-list, so the client owns
+  this hot-reload);
+- **future sessions in this project**: honored by kilo's own config merge
+  (project rules override global `~/.config/kilo/kilo.jsonc` per-pattern).
+
+The local file uses the same `permission` schema as the global config:
+
+```jsonc
+// .kilo/kilo.jsonc
+{
+  "permission": {
+    "bash": { "npm install *": "allow", "echo *": "allow" },
+    "external_directory": { "/tmp/*": "allow" },
+    "read": "allow"
+  }
+}
+```
+
+Notes:
+
+- The agent's own "Always allow" writes to the **global** config; this local
+  option is the project-scoped alternative.
+- JSONC comments are **not** preserved when the client rewrites the file (v1);
+  if the existing file is unparseable it is backed up to
+  `.kilo/kilo.jsonc.bak` before being rewritten.
+
+## Slash commands
+
+Most slash commands match the kilo TUI. `/exit`, `/quit`, `/help`, `/status`,
+and `/compact` are implemented client-side here; the rest
+are forwarded to the agent. Type `/help` inside the client for the full list.
+
+`/model` (`/models`) switches the active session's model in place, and
+`/thinking` chooses the active model's thinking/reasoning (effort) level. Both
+apply live via `session/set_config_option` and don't require a restart. When a
+model is switched via `/model`, if the new model exposes effort levels the
+client then prompts for a thinking level (Enter accepts the model's saved level
+from `model.json` when valid, else the level the agent already chose, else the
+first level; `c` skips). The
+active model's current thinking level is shown as a `thinking:` line in
+`/status` (only when the model has effort levels). Level display uses openrouter
+reasoning-effort names, with a model-specific alias shown as
+`<name> (<openrouter name>)` (e.g. `Max (high)`); a model's "default" resolves to
+the actual level it uses. `/thinking` also persists the choice as the model's
+default variant to kilo's state file (`~/.local/state/kilo/model.json`), so it
+survives restarts. Recently-used models are read from and written to that same
+state file's `recent` list (shared with kilo); a legacy per-project
+`.kilo/recent_models` file is migrated once and then removed.
+
+`/codex-usage` reports the ChatGPT-subscription rate-limit usage by reading
+Kilo's own OAuth login (`~/.local/share/kilo/auth.json`, the `openai` section)
+and calling OpenAI's undocumented `chatgpt.com/backend-api/wham/usage`
+endpoint. It prints the plan and the percentage left in the rolling 5h/7d
+windows with reset times. It never refreshes the token itself — the `kilo acp`
+child process keeps the access token rotated, so if the token is expired just
+run any kilo turn and retry. Only works for a ChatGPT (subscription) OAuth
+login, not an API-key login.
+
+`/compact` compacts the **main** session's context. ACP has no native
+compaction method, so this is a client-side summarize-then-seed: the current
+session is asked for a concise context brief, a new session is started, and the
+brief is sent as its first message. The old session is disposed and the
+thinking-summarizer subagent is restarted. Per-session usage is retained across
+compaction, so `/status` still shows the compacted-away session's tokens and
+cost.
+
+## Tests
+
+```
+npm test
+```
