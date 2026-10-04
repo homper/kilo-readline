@@ -60,6 +60,18 @@ const LEGACY_RECENT_MODELS_FILE = join(HISTORY_DIR, "recent_models");
 const RECENT_MODELS_STORE_CAP = 5;
 const RECENT_MODELS_SHOW = 2;
 
+// Startup tracing: set KILO_TRACE_STARTUP=1 to print monotonic timestamps to
+// stderr at each startup phase boundary, so a slow startup can be attributed
+// to the agent boot, the ACP handshake, session setup, or the usage fetches.
+const TRACE_STARTUP = !!process.env.KILO_TRACE_STARTUP;
+const TRACE_T0_MS = Number(process.hrtime.bigint() / 1_000_000n);
+function tlog(msg: string): void {
+  if (!TRACE_STARTUP) return;
+  const ms = Number(process.hrtime.bigint() / 1_000_000n) - TRACE_T0_MS;
+  process.stderr.write(`trace[+${(ms / 1000).toFixed(3)}s] ${msg}\n`);
+}
+tlog("module init");
+
 // Kilo's own model-state file (same one the TUI/CLI read+write): the saved
 // default thinking level per model (`variant` map) and the global recently-
 // used models list (`recent` array of {providerID, modelID}). We read/write
@@ -281,12 +293,12 @@ const sessionUsage = new Map<string, SessionUsage>();
 
 // Human-readable titles for main sessions, keyed by session id. Populated from
 // session/list (on resume and refreshed before /status) so the status view can
-// print the session name. Summarizer sessions have no meaningful title.
+// print the session name.
 const sessionNames = new Map<string, string>();
 
 function recordUsage(
   sessionId: string,
-  role: "main" | "summarizer",
+  role: "main",
   update: UsageUpdate,
 ): void {
   applyUsageUpdate(sessionUsage, sessionId, role, update);
@@ -324,37 +336,34 @@ let cliSessionTarget: string | undefined;
   }
 }
 
-// Thinking-summary via a second ACP session: instead of streaming the model's
-// raw thoughts, we ask a background session to summarize them. To keep cost and
-// latency down we summarize periodically, not on every chunk:
-//   - the first summary of a thinking block fires after SHORT_GAP (15s) so
-//     progress is visible instead of a silent "thinking…" line;
-//   - each subsequent summary in the same block waits GAP_STEP (10s) longer
-//     than the previous one, backing off until it reaches LONG_GAP (2 minutes),
-//     so a long reasoning session doesn't hammer the rate-limited small model.
-// Summarization is also skipped for thinking shorter than MIN_CHARS. All
-// tunable via env. Cap on sent text keeps the small-model prompt small.
-const THINK_SUMMARY_SHORT_GAP = (() => {
-  const n = Number.parseInt(process.env.KILO_THINK_SUMMARY_SHORT_GAP ?? process.env.KILO_THINK_SUMMARY_MIN_GAP ?? "", 10);
+// Show the latest raw thoughts periodically during long reasoning. The first
+// display fires after 15s; each following gap grows by 10s up to 2 minutes so
+// progress remains visible without flooding the terminal. Legacy summary timing
+// variables remain accepted because they were part of the documented interface.
+const THINK_DISPLAY_SHORT_GAP = (() => {
+  const n = Number.parseInt(
+    process.env.KILO_THINK_DISPLAY_SHORT_GAP ??
+      process.env.KILO_THINK_SUMMARY_SHORT_GAP ??
+      process.env.KILO_THINK_SUMMARY_MIN_GAP ??
+      "",
+    10,
+  );
   return Number.isFinite(n) && n >= 0 ? n : 15000;
 })();
-const THINK_SUMMARY_LONG_GAP = (() => {
-  const n = Number.parseInt(process.env.KILO_THINK_SUMMARY_LONG_GAP ?? "", 10);
+const THINK_DISPLAY_LONG_GAP = (() => {
+  const n = Number.parseInt(
+    process.env.KILO_THINK_DISPLAY_LONG_GAP ?? process.env.KILO_THINK_SUMMARY_LONG_GAP ?? "",
+    10,
+  );
   return Number.isFinite(n) && n >= 0 ? n : 120000;
 })();
-// How much the gap grows each time a summary fires within a thinking block,
-// so the summarizer backs off over a long reasoning session. Capped at
-// THINK_SUMMARY_LONG_GAP.
-const THINK_SUMMARY_GAP_STEP = (() => {
-  const n = Number.parseInt(process.env.KILO_THINK_SUMMARY_GAP_STEP ?? "", 10);
+const THINK_DISPLAY_GAP_STEP = (() => {
+  const n = Number.parseInt(
+    process.env.KILO_THINK_DISPLAY_GAP_STEP ?? process.env.KILO_THINK_SUMMARY_GAP_STEP ?? "",
+    10,
+  );
   return Number.isFinite(n) && n >= 0 ? n : 10000;
 })();
-const THINK_SUMMARY_MIN_CHARS = (() => {
-  const n = Number.parseInt(process.env.KILO_THINK_SUMMARY_MIN_CHARS ?? "", 10);
-  return Number.isFinite(n) && n >= 0 ? n : 400;
-})();
-// Cap how much thinking text we send to the summarizer so the prompt stays small.
-const THINK_SUMMARY_MAX_CHARS = 8000;
 
 function findKiloConfigPath(): string | null {
   const base = process.env.XDG_CONFIG_HOME
@@ -1868,433 +1877,6 @@ function buildAgentEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-// How long to block the agent's response for while waiting on the small-model
-// thinking summary. Tunable via env. The summary is best-effort: if the small
-// model is slow we fall back to a one-line stats summary after this delay.
-const SUMMARY_WAIT_MS = (() => {
-  const n = Number.parseInt(process.env.KILO_THINK_SUMMARY_WAIT_MS ?? "", 10);
-  return Number.isFinite(n) && n >= 0 ? n : 6000;
-})();
-
-// Resolve the small model to use for thinking summarization. Priority:
-// explicit env override > kilo config `small_model` > the kilo free dispatcher.
-function resolveSmallModel(kiloConfig: { config: Record<string, unknown> } | null): string {
-  const env = process.env.KILO_THINK_SUMMARY_MODEL?.trim();
-  if (env) return env;
-  const fromConfig = kiloConfig?.config.small_model;
-  if (typeof fromConfig === "string" && fromConfig.trim()) return fromConfig.trim();
-  return "kilo/kilo-auto/free";
-}
-
-// Build the environment for the summarizer subagent. It runs a separate `kilo
-// acp` process whose config is forced to the small model (e.g. the kilo free
-// dispatcher, which needs no user-supplied API key) and denies every tool, so
-// it can only summarize text — never run commands or touch files.
-function buildSummarizerEnv(model: string): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  env.LOG_LEVEL = "debug";
-  let config: Record<string, unknown> = {};
-  if (process.env.KILO_CONFIG_CONTENT) {
-    try {
-      config = JSON.parse(process.env.KILO_CONFIG_CONTENT) as Record<string, unknown>;
-    } catch {
-      config = {};
-    }
-  }
-  const existingAgent = (config.agent as Record<string, Record<string, unknown>>) ?? {};
-  const agent: Record<string, unknown> = {};
-  for (const key of Object.keys(existingAgent)) {
-    agent[key] = { ...existingAgent[key], model };
-  }
-  for (const key of ["code", "explore", "general", "ask"]) {
-    agent[key] = { ...(agent[key] as Record<string, unknown> | undefined), model };
-  }
-  // Force the `kilo` provider into the summarizer config when the small model is
-  // a `kilo/*` model (e.g. the free dispatcher). Without an explicit `kilo`
-  // provider entry, kilo may resolve `kilo/kilo-auto/free` only when it can, and
-  // fall back to the user's main provider/model (e.g. openrouter/glm) when the
-  // free tier is rate-limited — which silently bills the summarizer to glm.
-  const provider = { ...((config.provider as Record<string, unknown>) ?? {}) };
-  if (model.startsWith("kilo/") && !provider.kilo) {
-    provider.kilo = {};
-  }
-  env.KILO_CONFIG_CONTENT = JSON.stringify({
-    ...config,
-    provider,
-    model,
-    small_model: model,
-    agent,
-    permission: { "*": "deny" },
-  });
-  return env;
-}
-
-// Redact secret values (api keys / tokens) from a config object so it can be
-// logged safely. Returns a JSON string.
-function redactConfigForLog(obj: unknown): string {
-  const redact = (v: unknown): unknown => {
-    if (Array.isArray(v)) return v.map(redact);
-    if (v && typeof v === "object") {
-      const out: Record<string, unknown> = {};
-      for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
-        if (/key|token|secret|password|auth/i.test(k) && typeof val === "string") {
-          out[k] = val ? "***" : val;
-        } else {
-          out[k] = redact(val);
-        }
-      }
-      return out;
-    }
-    return v;
-  };
-  try {
-    return JSON.stringify(redact(obj));
-  } catch {
-    return "(unserializable)";
-  }
-}
-
-// A dedicated summarizer subagent: its own `kilo acp` process configured to use
-// the small model, exposed as a long-lived ACP session we prompt with thinking
-// text. Optional and best-effort — if it fails to start we fall back to a plain
-// stats summary, so the main client keeps working.
-class ThinkSummarizer {
-  readonly model: string;
-  private proc: ReturnType<typeof spawn> | null = null;
-  private connection: acp.ClientConnection | null = null;
-  private session: acp.ActiveSession | null = null;
-  private logStream: fs.WriteStream | null = null;
-  private ready = false;
-  private starting: Promise<string> | null = null;
-  // Latest usage_update seen from the summarizer session, surfaced by /status.
-  lastUsage = { used: 0, size: 0, costAmount: 0, costCurrency: "" };
-
-  constructor(model: string) {
-    this.model = model;
-  }
-
-  get available(): boolean {
-    return this.ready && this.session !== null;
-  }
-
-  get sessionId(): string | null {
-    return this.session?.sessionId ?? null;
-  }
-
-  private log(msg: string): void {
-    if (!this.logStream) return;
-    const line = `[${new Date().toISOString()}] ${msg}\n`;
-    try { this.logStream.write(line); } catch { /* ignore */ }
-  }
-
-  start(agentCmd: string, agentArgs: string[], cwd: string): Promise<string> {
-    if (this.starting) return this.starting as Promise<string>;
-    this.starting = (async (): Promise<string> => {
-      const logPath = join(HISTORY_DIR, "summarizer.log");
-      this.logStream = fs.createWriteStream(logPath, { flags: "a" });
-      const env = buildSummarizerEnv(this.model);
-      this.log(`start model=${this.model} agentCmd=${agentCmd} ${agentArgs.join(" ")} cwd=${cwd}`);
-      try {
-        this.log(`start env KILO_CONFIG_CONTENT=${redactConfigForLog(JSON.parse(env.KILO_CONFIG_CONTENT ?? "{}"))}`);
-      } catch { /* ignore */ }
-      this.proc = spawn(agentCmd, agentArgs, {
-        stdio: ["pipe", "pipe", "pipe"],
-        env,
-      });
-      this.proc.stderr!.pipe(this.logStream);
-      this.proc.on("error", (e) => { this.log(`proc error: ${e.message}`); this.ready = false; this.proc = null; });
-      this.proc.on("exit", (code, sig) => { this.log(`proc exit code=${code} signal=${sig}`); this.ready = false; this.proc = null; });
-      try {
-        const input = Writable.toWeb(this.proc.stdin!);
-        const output = Readable.toWeb(this.proc.stdout!) as ReadableStream<Uint8Array>;
-        const stream = acp.ndJsonStream(input, output);
-        this.connection = acp
-          .client({ name: "kilo-acp-summarizer" })
-          .onRequest(acp.methods.client.session.requestPermission, () => ({
-            outcome: { outcome: "cancelled" as const },
-          }))
-          .onRequest(acp.methods.client.fs.writeTextFile, () => ({}))
-          .onRequest(acp.methods.client.fs.readTextFile, () => ({ content: "" }))
-          .connect(stream);
-        const cx = this.connection.agent;
-        await cx.request(acp.methods.agent.initialize, {
-          protocolVersion: acp.PROTOCOL_VERSION,
-          clientCapabilities: {
-            fs: { readTextFile: false, writeTextFile: false },
-          },
-        });
-        this.session = await cx.buildSession(cwd).start();
-        this.ready = true;
-        this.log(`ready model=${this.model} session=${this.session.sessionId}`);
-        return "ready";
-      } catch (err) {
-        this.log(`start failed: ${(err as Error).message}`);
-        this.disposeInternal();
-        return `unavailable: ${(err as Error).message}`;
-      }
-    })();
-    return this.starting;
-  }
-
-  async summarize(prompt: string): Promise<string | null> {
-    if (!this.available || !this.session) return null;
-    this.log(`summarize promptLen=${prompt.length} session=${this.session.sessionId}`);
-    try {
-      await this.session.prompt(prompt);
-      // Drain updates ourselves instead of readText() so we can capture
-      // usage_update notifications for /status. Only agent_message_chunk
-      // text contributes to the summary; everything else is ignored.
-      let text = "";
-      for (;;) {
-        const msg = await this.session.nextUpdate();
-        if (msg.kind === "stop") break;
-        const upd = msg.update as Record<string, any>;
-        if (upd.sessionUpdate === "agent_message_chunk" && upd.content?.type === "text") {
-          text += upd.content.text;
-        } else if (upd.sessionUpdate === "usage_update") {
-          this.lastUsage = {
-            used: Number(upd.used) || 0,
-            size: Number(upd.size) || 0,
-            costAmount: Number(upd.cost?.amount ?? 0) || 0,
-            costCurrency: typeof upd.cost?.currency === "string" ? upd.cost.currency : "",
-          };
-          const sid = this.session?.sessionId;
-          if (sid) recordUsage(sid, "summarizer", upd);
-        }
-      }
-      this.log(`summarize ok resultLen=${text.length}`);
-      return text.trim();
-    } catch (err) {
-      this.log(`summarize failed: ${(err as Error).message}`);
-      return null;
-    }
-  }
-
-  private disposeInternal() {
-    try { this.session?.dispose(); } catch { /* ignore */ }
-    try { this.connection?.close(); } catch { /* ignore */ }
-    this.session = null;
-    this.connection = null;
-    this.ready = false;
-    if (this.proc) {
-      try { this.proc.kill("SIGTERM"); } catch { /* ignore */ }
-      this.proc = null;
-    }
-    try { this.logStream?.end(); } catch { /* ignore */ }
-    this.logStream = null;
-  }
-
-  dispose() {
-    this.disposeInternal();
-  }
-}
-
-let thinkSummarizer: ThinkSummarizer | null = null;
-
-// Holds the latest thinking summary for a turn and prints it at safe points:
-// immediately when a mid-thinking summary resolves (so long thinking isn't
-// silent), after the user answers a permission prompt, or just
-// before the agent's response text. While a prompt is on screen the deferred
-// summary is held so it never interleaves with it; only the most recent one is
-// shown.
-class SummaryGate {
-  private summarizer: ThinkSummarizer | null;
-  private pending: Promise<string | null> | null = null;
-  private latest: string | null = null;
-  private fallback: string | null = null;
-  private dirty = false;
-  private inFlight = false;
-  private lastAt = 0;
-  private token = 0;
-  // Start of the current thinking block, used by the adaptive gap (short gap
-  // while the block is fresh, long gap once it has run a long time).
-  private blockStart = 0;
-  // How many summaries have fired in the current thinking block. The gap
-  // grows by THINK_SUMMARY_GAP_STEP each fire so a long block backs off from
-  // SHORT_GAP toward LONG_GAP instead of running at a fixed cadence.
-  private gapCount = 0;
-  // True while a prompt turn is in progress. Once the turn ends (the agent has
-  // finished and we're back at the `kilo>` prompt) this is false, so a
-  // late-resolving summary is dropped instead of being printed into the prompt
-  // line and corrupting the user's input.
-  private turnActive = false;
-  // True once the current turn has produced any "real" output (a tool call, a
-  // tool-call update, or the agent's response text). While set, the mid-block
-  // "summarizing thinking…" marker and the immediate mid-block summary emit
-  // are suppressed so the stderr chrome can't interleave with stdout tool/
-  // response output. The single pre-response summary (emitBeforeResponse) and
-  // the post-permission emit (emitIfResolved at a safe point) still fire.
-  realOutputSeen = false;
-
-  constructor(summarizer: ThinkSummarizer | null) {
-    this.summarizer = summarizer;
-  }
-
-  // Adaptive gap: start at SHORT_GAP and add GAP_STEP for every summary that
-  // has already fired in this block, so the cadence backs off toward LONG_GAP
-  // (2 minutes) instead of a fixed interval over a long reasoning session.
-  private gapMs(): number {
-    const gap = THINK_SUMMARY_SHORT_GAP + this.gapCount * THINK_SUMMARY_GAP_STEP;
-    return gap > THINK_SUMMARY_LONG_GAP ? THINK_SUMMARY_LONG_GAP : gap;
-  }
-
-  private statsLine(dur: number, usedTokens: number, thoughtChars: number): string {
-    const usage = usedTokens > 0 ? ` · ${usedTokens} tokens` : "";
-    const chars = thoughtChars > 0 ? ` · ${thoughtChars} chars` : "";
-    return `💭 thought ${dur}s${usage}${chars}`;
-  }
-
-  // Start a small-model summary of `text` if the adaptive gap has elapsed, the
-  // text is substantial, and the summarizer is free. Always records the stats
-  // fallback (printed if no real summary lands). Only the last portion of the
-  // thinking is sent to keep the small-model prompt tiny. When `printImmediate`
-  // is true (mid-thinking ticks) the result is printed as soon as it resolves;
-  // otherwise it is left for emitBeforeResponse/emitIfResolved at a safe point.
-  private fire(
-    text: string,
-    dur: number,
-    usedTokens: number,
-    thoughtChars: number,
-    printImmediate: boolean,
-  ): void {
-    this.fallback = this.statsLine(dur, usedTokens, thoughtChars);
-    this.dirty = true;
-    if (!this.summarizer || !this.summarizer.available || this.inFlight) return;
-    if (text.length < THINK_SUMMARY_MIN_CHARS) return;
-    if (Date.now() - this.lastAt < this.gapMs()) return;
-    this.lastAt = Date.now();
-    this.gapCount++;
-    this.inFlight = true;
-    // Suppress the live "summarizing thinking…" marker once the turn has
-    // produced real (stdout) output — writing it to stderr then would
-    // interleave with the tool/response output and read as noise.
-    if (printImmediate && !awaitingUserInput && !this.realOutputSeen) {
-      process.stderr.write(`   ${C.gray}💭 summarizing thinking…${C.reset}\n`);
-    }
-    const tok = ++this.token;
-    const snippet = text.slice(-THINK_SUMMARY_MAX_CHARS);
-    const prompt =
-      "Summarize the following reasoning in one short sentence. " +
-      "Do not use any tools. Reply with only the summary, no preamble.\n\n" +
-      `"""${snippet}"""`;
-    const startedDur = dur;
-    this.pending = this.summarizer
-      .summarize(prompt)
-      .then((s) => {
-        if (tok !== this.token) return null;
-        const t = (s ?? "").trim();
-        if (t) this.latest = `💭 summary (${startedDur}s): ${t}`;
-        return t || null;
-      })
-      .catch(() => null)
-      .finally(() => {
-        if (tok === this.token) this.inFlight = false;
-        // Print immediately only at a safe point (no permission prompt on
-        // screen) and only when no real output has been emitted this
-        // turn; otherwise leave it for emitIfResolved/emitBeforeResponse to
-        // print at the next safe point.
-        if (printImmediate && !awaitingUserInput && !this.realOutputSeen) this.emitIfResolved();
-      });
-  }
-
-  // Mark the start of a thinking block so the adaptive gap can measure how long
-  // the current block has been running. Also seed `lastAt` to the block start:
-  // `reset()` leaves it at 0, which would make `Date.now() - lastAt` enormous and
-  // so the gap check in `fire()` would pass on the very first heartbeat (~2s),
-  // firing a summary far earlier than the intended SHORT_GAP. That premature
-  // summary tends to resolve right as a quick tool call shows its permission
-  // prompt, and (being `printImmediate`) it lands on the prompt line. Seeding
-  // `lastAt` here keeps the first summary SHORT_GAP after the block starts.
-  beginThinking(): void {
-    this.blockStart = Date.now();
-    this.lastAt = this.blockStart;
-    this.gapCount = 0;
-  }
-
-  // Called from the heartbeat while a thinking block is active. Fires a summary
-  // (printed immediately on resolve) so long thinking shows progress instead of
-  // a silent "thinking…" line.
-  tickThinking(text: string, dur: number, usedTokens: number, thoughtChars: number): void {
-    this.fire(text, dur, usedTokens, thoughtChars, true);
-  }
-
-  // Called when a thinking block ends. Fires a summary for the deferred emit
-  // before the response; always records the stats fallback so something shows.
-  onThinkingEnd(text: string, dur: number, usedTokens: number, thoughtChars: number): void {
-    this.blockStart = 0;
-    this.fire(text, dur, usedTokens, thoughtChars, false);
-  }
-
-  // After a permission prompt is answered: print the summary only if it has
-  // already occurred (resolved). Never block — an in-flight summary is left for
-  // the before-response flush.
-  //
-  // Never print while a permission prompt is on screen: the prompt
-  // is written to stdout with no trailing newline, and this line goes to stderr,
-  // so emitting here would append onto the prompt line and corrupt it. Leave the
-  // summary dirty for the post-answer emit (handleRequestPermission calls this
-  // again once awaitingUserInput is false).
-  emitIfResolved(): void {
-    if (!this.turnActive) return;
-    if (!this.dirty) return;
-    if (awaitingUserInput) return;
-    if (this.pending !== null && this.latest === null) return;
-    const line = this.latest ?? this.fallback;
-    this.dirty = false;
-    this.latest = null;
-    if (line) process.stderr.write(`   ${C.gray}${line}${C.reset}\n`);
-  }
-
-  // Before the agent's response text: wait briefly for the small-model summary
-  // and print it (or the stats fallback). Prints at most once per dirty cycle.
-  async emitBeforeResponse(): Promise<void> {
-    if (!this.turnActive) return;
-    if (!this.dirty) return;
-    if (awaitingUserInput) return;
-    if (this.pending !== null) {
-      try {
-        await Promise.race([
-          this.pending,
-          new Promise<null>((r) => setTimeout(() => r(null), SUMMARY_WAIT_MS)),
-        ]);
-      } catch {
-        /* ignore */
-      }
-      this.pending = null;
-    }
-    // A permission prompt may have appeared while we waited for
-    // the small-model summary. Don't print onto its line (the prompt is on
-    // stdout with no trailing newline, this goes to stderr): leave the
-    // summary dirty for the post-answer emitIfResolved to flush at a safe
-    // point once awaitingUserInput is false again.
-    if (awaitingUserInput) return;
-    const line = this.latest ?? this.fallback;
-    this.dirty = false;
-    this.latest = null;
-    if (line) process.stderr.write(`   ${C.gray}${line}${C.reset}\n`);
-  }
-
-  reset() {
-    this.turnActive = true;
-    this.dirty = false;
-    this.pending = null;
-    this.latest = null;
-    this.fallback = null;
-    this.blockStart = 0;
-    this.lastAt = 0;
-    this.gapCount = 0;
-    this.realOutputSeen = false;
-  }
-
-  // Called when the agent's turn has ended and we're returning to the prompt.
-  // Late-resolving summaries are dropped rather than printed into the prompt.
-  endTurn(): void {
-    this.turnActive = false;
-  }
-}
-
-let summaryGate: SummaryGate | null = null;
-
 function colorCommand(c: string): string {
   const implemented = IMPLEMENTED_COMMANDS.has(c);
   const code = implemented ? C.green : C.cyan;
@@ -2901,10 +2483,8 @@ let agentExited = false;
 function cleanup(exitCode = 0): void {
   if (agentExited) return;
   agentExited = true;
-  // Print the final /status view and persist the just-exited session as
-  // last_session before tearing anything down (so the summarizer state and
-  // active session id are still intact for display). Best-effort: never let
-  // an error here block the exit.
+  // Print the final /status view and persist the just-exited session before
+  // tearing anything down. Best-effort: never let an error here block exit.
   if (beforeExitHook) {
     try { beforeExitHook(); } catch { /* ignore */ }
   }
@@ -2918,8 +2498,6 @@ function cleanup(exitCode = 0): void {
     agentProcess = null;
   }
   stopPermissionFileWatcher();
-  try { thinkSummarizer?.dispose(); } catch { /* ignore */ }
-  thinkSummarizer = null;
   rawInput.close();
   if (process.stdin.isTTY) {
     try { process.stdout.write("\x1b[?2004l"); } catch { /* ignore */ }
@@ -3263,11 +2841,13 @@ async function resolveInitialSession(
 
   if (target) {
     try {
+      tlog(`resolveInitialSession: session.load ${target}`);
       const loadRes = await ctx.request(acp.methods.agent.session.load, {
         sessionId: target,
         cwd,
         mcpServers: [],
       });
+      tlog("resolveInitialSession: session.load done");
       // The load response carries the session's current config options,
       // including the model the resumed session actually uses — which may
       // differ from the live config `model` (regular kilo pins a session to
@@ -3283,8 +2863,12 @@ async function resolveInitialSession(
       );
       const ms = new ManualSession(target, ctx, registerManualPush);
       recordUsage(target, "main", {});
+      tlog("resolveInitialSession: drainHistory begin");
       const { summary } = await drainHistory(ms);
+      tlog("resolveInitialSession: drainHistory done");
+      tlog("resolveInitialSession: fetchSessionTitle (resume path)");
       const name = await fetchSessionTitle(ctx, target);
+      tlog("resolveInitialSession: fetchSessionTitle done (resume path)");
       if (name) sessionNames.set(target, name);
       writeLastSession(target);
       return {
@@ -3307,7 +2891,9 @@ async function resolveInitialSession(
     );
   }
 
+  tlog("resolveInitialSession: session/new begin");
   const fresh = await ctx.buildSession(cwd).start();
+  tlog("resolveInitialSession: session/new done");
   // A fresh session uses the config `model` by default; capture the model
   // select (current value + available options) from the session/new response
   // too, so /model works identically for fresh and resumed sessions.
@@ -3323,6 +2909,7 @@ async function resolveInitialSession(
     sel,
     esel,
   ));
+  tlog("resolveInitialSession: restoreFreshSessionEffort done");
   writeLastSession(fresh.sessionId);
   recordUsage(fresh.sessionId, "main", {});
   return {
@@ -3350,11 +2937,6 @@ async function handleCompact(
   ctx: acp.ClientContext,
   getSession: () => MainSession,
   setSession: (s: MainSession) => void,
-  deps: {
-    kiloConfig: { config: Record<string, unknown> } | null;
-    agentCmd: string;
-    agentArgs: string[];
-  },
 ): Promise<void> {
   const oldSession = getSession();
   console.log(`\n${C.bold}Compacting main session…${C.reset}`);
@@ -3451,17 +3033,6 @@ async function handleCompact(
   } catch {
     /* ignore — seed turn is best-effort */
   }
-
-  // 4. Restart the summarizer subagent so it does not accumulate stale state.
-  try {
-    thinkSummarizer?.dispose();
-  } catch {
-    /* ignore */
-  }
-  const smallModel = resolveSmallModel(deps.kiloConfig);
-  thinkSummarizer = new ThinkSummarizer(smallModel);
-  summaryGate = new SummaryGate(thinkSummarizer);
-  thinkSummarizer.start(deps.agentCmd, deps.agentArgs, process.cwd()).catch(() => {});
 
   console.log(`\n✅ Compacted → new session ${fresh.sessionId}\n`);
   setInputTarget("main");
@@ -4027,6 +3598,7 @@ async function handleThinking(ctx: acp.ClientContext): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  tlog("main() entered");
   const agentCmd = process.env.KILO_AGENT_CMD || "kilo";
   const agentArgs = process.env.KILO_AGENT_ARGS
     ? process.env.KILO_AGENT_ARGS.split(" ")
@@ -4046,6 +3618,7 @@ async function main(): Promise<void> {
     stdio: ["pipe", "pipe", "pipe"],
     env: buildAgentEnv(),
   });
+  tlog(`agent spawned: ${agentCmd} ${agentArgs.join(" ")}`);
 
   agentProcess.on("error", (err) => {
     console.error(`\n❌ Failed to spawn agent "${agentCmd}": ${err.message}`);
@@ -4357,11 +3930,6 @@ async function main(): Promise<void> {
       } finally {
         stopAwaitingUserInput();
       }
-      // The user has answered: emit any thinking summary that occurred while the
-      // prompt was on screen. Only the last summary is shown, and only if the
-      // small-model result already arrived — otherwise it's left for the
-      // before-response flush so the user isn't made to wait.
-      summaryGate?.emitIfResolved();
   };
 
   // Only one permission prompt may own stdin at a time. Parallel tool calls can
@@ -4418,6 +3986,7 @@ async function main(): Promise<void> {
       })
       .connectWith(stream, async (ctx) => {
         connectCtx = ctx;
+        tlog("sending agent.initialize");
         const initResult = await ctx.request(acp.methods.agent.initialize, {
           protocolVersion: acp.PROTOCOL_VERSION,
           clientCapabilities: {
@@ -4427,9 +3996,12 @@ async function main(): Promise<void> {
             },
           },
         });
+        tlog("agent.initialize done");
         agentCapabilities = (initResult as { agentCapabilities?: { loadSession?: boolean; [k: string]: unknown } | null }).agentCapabilities ?? null;
 
+        tlog("resolveInitialSession: begin");
         const { session: initialSession, name: resumedName, summary: resumedSummary, model: resumedModel, modelOptions: resumedModelOptions, effort: resumedEffort, effortOptions: resumedEffortOptions } = await resolveInitialSession(ctx);
+        tlog("resolveInitialSession: done");
         let session: MainSession = initialSession;
         activeSession = session;
         // Pin the displayed model to the one the resumed/fresh session actually
@@ -4447,33 +4019,6 @@ async function main(): Promise<void> {
         activeEffort = resumedEffort;
         sessionEffortOptions = resumedEffortOptions;
         if (resumedModel) recordRecentModel(resumedModel);
-
-        // Thinking summaries run on a separate subagent forced to the small
-        // model (e.g. the kilo free dispatcher). Started in the background so it
-        // never delays the main loop; if it fails the summary falls back to a
-        // plain stats line. We wait briefly for it to come up so the status
-        // output reflects the real summarizer state; on failure we surface the
-        // error but otherwise stay quiet.
-        const smallModel = resolveSmallModel(kiloConfig);
-        thinkSummarizer = new ThinkSummarizer(smallModel);
-        summaryGate = new SummaryGate(thinkSummarizer);
-        let summarizerStatus: string | null = null;
-        try {
-          summarizerStatus = await Promise.race([
-            thinkSummarizer.start(agentCmd, agentArgs, process.cwd()),
-            new Promise<string>((r) => setTimeout(() => r("timeout"), 10000)),
-          ]);
-        } catch (err) {
-          summarizerStatus = `unavailable: ${(err as Error).message}`;
-        }
-        if (summarizerStatus === "timeout") {
-          // Still starting — let it finish in the background without chatter.
-          thinkSummarizer
-            .start(agentCmd, agentArgs, process.cwd())
-            .catch(() => {});
-        } else if (summarizerStatus && summarizerStatus !== "ready") {
-          console.error(`⚠️  Summarizer subagent ${summarizerStatus}.`);
-        }
 
         const formatCost = (amount: number, currency: string): string => {
           const sym = currency.toUpperCase() === "USD" ? "$" : currency ? `${currency} ` : "$";
@@ -4615,11 +4160,7 @@ async function main(): Promise<void> {
           return `${C.dim}       ${id}  ctx ${ctx}  cost ${cost}${cacheBit}${C.reset}`;
         };
 
-        // The summarizer block is only interesting in an interactive /status;
-        // at startup and on exit it's noise, so callers pass `showSummarizer: false`
-        // there (default true for the /status command).
-        const printStatus = (opts: { showSummarizer?: boolean } = {}): void => {
-          const showSummarizer = opts.showSummarizer !== false;
+        const printStatus = (): void => {
           // Prefer the model the active session actually uses (reported by
           // `session/load` on resume); fall back to the config `model` for
           // fresh sessions or when the agent didn't expose config options.
@@ -4631,8 +4172,6 @@ async function main(): Promise<void> {
           // the cache split is supplemented from the local message history.
           const cacheIds = new Set<string>(sessionUsage.keys());
           if (mainId) cacheIds.add(mainId);
-          const sumIdNow = thinkSummarizer?.sessionId ?? null;
-          if (sumIdNow) cacheIds.add(sumIdNow);
           const cacheBySession = readKiloCachedTokens(Array.from(cacheIds));
           const sessionCache = (id: string | null): number | null => {
             if (!id) return null;
@@ -4682,8 +4221,7 @@ async function main(): Promise<void> {
           // screen, and the exit print (all via printStatus) whenever at least
           // one provider's login exists. Each provider gets its own line, with
           // the 5h reset shown as a TIME (HH:MM) and the 7d reset as a
-          // DATE+TIME. Format mirrors the post-turn usage line (formatQuotaLines
-          // is shared between the two). Shown above the summarizer block.
+          // DATE+TIME. Format mirrors the post-turn usage line.
           const quotaLines = formatQuotaLines();
           if (quotaLines.length > 0) {
             console.log(`  ${C.bold}quota${C.reset}`);
@@ -4692,38 +4230,6 @@ async function main(): Promise<void> {
             }
           }
 
-          // Summarizer block — entire block rendered grey. No "state:" field;
-          // current summarizer session plus any prior ones (restarted on
-          // compact) as compact rows. Only shown in an interactive /status;
-          // skipped at startup and on exit (showSummarizer gate).
-          if (showSummarizer) {
-            const sumId = thinkSummarizer?.sessionId ?? null;
-            const sumUsage = thinkSummarizer?.lastUsage ?? null;
-            console.log(`  ${C.dim}summarizer${C.reset}`);
-            console.log(`     ${C.dim}session : ${sumId ?? "(none)"}${C.reset}`);
-            console.log(`     ${C.dim}model   : ${smallModel}${C.reset}`);
-            if (sumUsage && (sumUsage.used > 0 || sumUsage.size > 0)) {
-              if (sumUsage.size > 0) {
-                console.log(`     ${C.dim}context : ${sumUsage.used.toLocaleString()} / ${sumUsage.size.toLocaleString()} tokens${C.reset}`);
-              } else if (sumUsage.used > 0) {
-                console.log(`     ${C.dim}context : ${sumUsage.used.toLocaleString()} tokens${C.reset}`);
-              }
-            }
-            if (sumUsage && sumUsage.costAmount > 0) {
-              console.log(`     ${C.dim}cost    : ${formatCost(sumUsage.costAmount, sumUsage.costCurrency)} (cumulative)${C.reset}`);
-            }
-            const sumCache = sessionCache(sumId);
-            if (sumCache != null && sumCache > 0) {
-              console.log(`     ${C.dim}cache  : ${sumCache.toLocaleString()} tokens (cached reads)${C.reset}`);
-            }
-            const prevSum = Array.from(sessionUsage.entries()).filter(
-              ([id, u]) => u.role === "summarizer" && id !== sumId,
-            );
-            if (prevSum.length > 0) {
-              console.log(`     ${C.dim}previous:${C.reset}`);
-              for (const [id, u] of prevSum) console.log(formatCompactRow(id, u, sessionCache(id)));
-            }
-          }
           console.log();
         };
 
@@ -4733,7 +4239,7 @@ async function main(): Promise<void> {
         // including Ctrl+C and Ctrl+D, which bypass the normal /exit break.
         beforeExitHook = () => {
           if (!activeSession) return;
-          printStatus({ showSummarizer: false });
+          printStatus();
           writeLastSession(activeSession.sessionId);
         };
 
@@ -4741,11 +4247,15 @@ async function main(): Promise<void> {
         // plus — when resuming via -c/-s — a quick name and one-line summary of
         // the resumed session.
         if (activeSession) {
+          tlog("startup fetchSessionTitle begin");
           const title = await fetchSessionTitle(ctx, activeSession.sessionId);
+          tlog("startup fetchSessionTitle done");
           if (title) sessionNames.set(activeSession.sessionId, title);
         }
+        tlog("refreshAllUsage (startup) begin");
         await refreshAllUsage();
-        printStatus({ showSummarizer: false });
+        tlog("refreshAllUsage (startup) done");
+        printStatus();
         if (session instanceof ManualSession) {
           const label = resumedName ? `name: ${resumedName}` : `session: ${session.sessionId}`;
           const summaryLine = resumedSummary
@@ -4755,6 +4265,7 @@ async function main(): Promise<void> {
         }
 
         inMainLoop = true;
+        tlog("first prompt ready (main loop entered)");
         while (true) {
           resetCancel();
           setInputTarget("main");
@@ -4819,7 +4330,7 @@ async function main(): Promise<void> {
               activeSession = s;
               // activeSessionModel and sessionModelOptions are refreshed by
               // handleCompact from the fresh session's response.
-            }, { kiloConfig, agentCmd, agentArgs });
+            });
             continue;
           }
 
@@ -4953,64 +4464,60 @@ async function main(): Promise<void> {
           let thinkingHeaderShown = false;
           let thinkingActive = false;
           let thinkingStart = 0;
-          let thoughtChars = 0;
           let thoughtText = "";
           // The trimmed text of the most recently ended thinking block, kept so
           // we can echo its last few lines when the agent starts a tool call.
           let lastThoughtText = "";
-          // True once we've echoed the recent thinking for the current block, so
-          // consecutive tool calls without new thinking don't reprint the same
-          // lines. Reset when a new thinking block begins.
-          let recentThinkingShown = false;
+          // The rendered tail is retained so a tool call does not repeat the
+          // exact same thoughts that a periodic update just displayed.
+          let lastShownThoughtTail = "";
+          let lastThoughtDisplayAt = 0;
+          let thoughtDisplayCount = 0;
           // A provider 529 (overloaded) error sometimes surfaces inside the
           // streamed thinking text while the model retries. We emit a tiny red
           // "529" marker once per thinking block so the user can see the retry
           // without the noise of the full error. Written to stderr so it never
           // interferes with the input prompt or the agent's response text.
           let thought529Shown = false;
-          let responseSummaryEmitted = false;
           let stopReason: string | undefined;
           const deferredOutputs: Array<string | (() => string)> = [];
-          summaryGate?.reset();
-          responseSummaryEmitted = false;
 
-          // When a thinking block ends, hand it to the summary gate. The gate
-          // starts a small-model summary (or records the stats fallback) but
-          // prints nothing yet — output is deferred to a safe point: after the
-          // user answers a permission prompt, or just before the
-          // agent's response text. See SummaryGate.
           const endThinking = () => {
             if (!thinkingActive) return;
             thinkingActive = false;
-            const dur = Math.max(1, Math.round((Date.now() - thinkingStart) / 1000));
-            const text = thoughtText.trim();
-            lastThoughtText = text;
-            summaryGate?.onThinkingEnd(text, dur, usedTokens, thoughtChars);
+            lastThoughtText = thoughtText.trim();
           };
 
           // Echo the last few non-empty lines of the most recent thinking block
-          // before a tool call, so the user can see what reasoning led to the
-          // action. Printed once per thinking block (see recentThinkingShown).
-          // Lines are capped in length to keep the output compact.
+          // before a tool call and periodically during long thinking. Lines are
+          // capped in length to keep output compact.
           const RECENT_THINKING_LINES = 3;
           const RECENT_THINKING_LINE_MAX = 200;
-          const printRecentThinking = () => {
-            if (recentThinkingShown) return;
-            if (!lastThoughtText) return;
-            const lines = lastThoughtText
+          const printRecentThinking = (text: string, elapsed?: number): boolean => {
+            if (!text) return false;
+            const lines = text
               .split("\n")
               .map((l) => l.trim())
               .filter(Boolean)
-              .slice(-RECENT_THINKING_LINES);
-            if (lines.length === 0) return;
-            process.stderr.write(`   ${C.gray}💭 last thoughts:${C.reset}\n`);
-            for (let l of lines) {
-              if (l.length > RECENT_THINKING_LINE_MAX) {
-                l = l.slice(0, RECENT_THINKING_LINE_MAX - 1) + "…";
-              }
-              process.stderr.write(`   ${C.gray}  ${l}${C.reset}\n`);
+              .slice(-RECENT_THINKING_LINES)
+              .map((line) => line.length > RECENT_THINKING_LINE_MAX
+                ? "…" + line.slice(-(RECENT_THINKING_LINE_MAX - 1))
+                : line);
+            if (lines.length === 0) return false;
+            const tail = lines.join("\n");
+            if (tail === lastShownThoughtTail) return false;
+            const timing = elapsed == null ? "" : ` (${elapsed}s)`;
+            process.stderr.write(`   ${C.gray}💭 last thoughts${timing}:${C.reset}\n`);
+            for (const line of lines) {
+              process.stderr.write(`   ${C.gray}  ${line}${C.reset}\n`);
             }
-            recentThinkingShown = true;
+            lastShownThoughtTail = tail;
+            return true;
+          };
+
+          const currentThoughtDisplayGap = (): number => {
+            const gap = THINK_DISPLAY_SHORT_GAP + thoughtDisplayCount * THINK_DISPLAY_GAP_STEP;
+            return Math.min(gap, THINK_DISPLAY_LONG_GAP);
           };
 
           // Print any agent response text held back because it didn't end in a
@@ -5049,15 +4556,17 @@ async function main(): Promise<void> {
             if (awaitingUserInput) return;
             if (Date.now() - lastUserInputEndedAt < 5000) return;
 
-            // Periodic thinking summary: while a block is active, ask the small
-            // model to summarize progress at least once per SHORT_GAP, backing
-            // off to LONG_GAP once the block has run a long time. The summary is
-            // printed as soon as it resolves (see SummaryGate.tickThinking), so
-            // long thinking isn't silent. Runs before the idle-heartbeat guards
-            // below so it still fires while chunks are arriving.
-            if (thinkingActive) {
+            // Show the current thought tail on an adaptive cadence even while
+            // chunks are arriving, before the idle-heartbeat guards below.
+            if (
+              thinkingActive &&
+              Date.now() - lastThoughtDisplayAt >= currentThoughtDisplayGap()
+            ) {
               const dur = Math.max(1, Math.round((Date.now() - thinkingStart) / 1000));
-              summaryGate?.tickThinking(thoughtText.trim(), dur, usedTokens, thoughtChars);
+              if (printRecentThinking(thoughtText.trim(), dur)) {
+                lastThoughtDisplayAt = Date.now();
+                thoughtDisplayCount++;
+              }
             }
 
             const idle = Date.now() - lastActivity;
@@ -5097,12 +4606,7 @@ async function main(): Promise<void> {
                 break;
               case "agent_message_chunk":
                 endThinking();
-                summaryGate && (summaryGate.realOutputSeen = true);
                 if (update.content.type === "text") {
-                  if (!responseSummaryEmitted) {
-                    responseSummaryEmitted = true;
-                    await summaryGate?.emitBeforeResponse();
-                  }
                   gotText = true;
                   responseText += update.content.text;
                   outputLineBuffer += update.content.text;
@@ -5139,14 +4643,13 @@ async function main(): Promise<void> {
                 if (!thinkingActive) {
                   thinkingActive = true;
                   thinkingStart = Date.now();
-                  thoughtChars = 0;
                   thoughtText = "";
                   thought529Shown = false;
-                  recentThinkingShown = false;
-                  summaryGate?.beginThinking();
+                  lastShownThoughtTail = "";
+                  lastThoughtDisplayAt = thinkingStart;
+                  thoughtDisplayCount = 0;
                 }
                 if (update.content.type === "text") {
-                  thoughtChars += update.content.text.length;
                   thoughtText += update.content.text;
                   // Surface a provider 529 (overloaded) retry as a small red
                   // marker, once per thinking block. Only checked while we are
@@ -5168,14 +4671,13 @@ async function main(): Promise<void> {
                   break;
                 }
                 gotTool = true;
-                summaryGate && (summaryGate.realOutputSeen = true);
                 // Flush any narration the agent streamed without a trailing
                 // newline so it appears before the tool block, not trapped in
                 // the line buffer until the end of the turn.
                 flushPendingOutput();
                 // Echo the last few lines of the just-ended thinking block so
                 // the user sees what reasoning led to the action.
-                printRecentThinking();
+                printRecentThinking(lastThoughtText);
                 // Remember what's running so the heartbeat can name it while we
                 // wait for the result (e.g. a slow grep won't look frozen).
                 {
@@ -5193,7 +4695,6 @@ async function main(): Promise<void> {
                   activeToolLabel = null;
                   break;
                 }
-                summaryGate && (summaryGate.realOutputSeen = true);
                 // Flush any narration that arrived since the tool was announced
                 // (e.g. text streamed without a trailing newline) before showing
                 // the status transition / diff.
@@ -5388,14 +4889,6 @@ async function main(): Promise<void> {
             }
           }
 
-          // If the turn ended without any response text (e.g. only tool calls),
-          // the thinking summary was never flushed before a response. Emit any
-          // already-resolved summary now; we don't block here so a cancel or a
-          // tool-only turn ends promptly.
-          if (!responseSummaryEmitted) {
-            summaryGate?.emitIfResolved();
-          }
-
           if (outputLineBuffer.length > 0) {
             if (inCodeFence) {
               process.stdout.write(outputLineBuffer);
@@ -5438,7 +4931,6 @@ async function main(): Promise<void> {
           }
 
           clearHeartbeat();
-          summaryGate?.endTurn();
 
           console.log("\n------------------------------------------------");
           } catch (err) {
@@ -5448,7 +4940,6 @@ async function main(): Promise<void> {
               );
             }
             clearHeartbeat();
-            summaryGate?.endTurn();
           }
         }
 

@@ -8,8 +8,8 @@ using Node's `@agentclientprotocol/sdk`.
 
 Instead of kilo's full terminal UI, this client drives the agent from a plain
 readline-style prompt (`kilo> `). It spawns a `kilo acp` child process, opens an
-ACP session, and renders model output, tool calls, diffs, tables, and thinking
-summaries as colored text directly in the terminal.
+ACP session, and renders model output, tool calls, diffs, tables, and recent
+thoughts as colored text directly in the terminal.
 
 Features:
 
@@ -25,10 +25,9 @@ Features:
   underline, inline code, and column-width-aware tables that wrap to the
   terminal width.
 - Permission prompts answered inline via typed digits or `c` to cancel.
-- Best-effort thinking summarization: a second `kilo acp` subagent running a
-  small/free model periodically summarizes the agent's reasoning blocks so long
-  thinking shows progress instead of a silent line. Tunable via
-  `KILO_THINK_SUMMARY_*` env vars and falls back to a stats line if unavailable.
+- Recent thought display: the tail of the agent's raw reasoning is shown before
+  tool calls and periodically during long thinking. The periodic cadence backs
+  off over time and is tunable via `KILO_THINK_DISPLAY_*` environment variables.
 - Ctrl+C cancels the current turn (and the underlying ACP request) instead of
   killing the client; a second Ctrl+C at an empty prompt exits.
 
@@ -39,9 +38,8 @@ Features:
   https://kilo.ai (see https://kilo.ai/docs for setup). The agent command and
   args can be overridden with `KILO_AGENT_CMD` and `KILO_AGENT_ARGS`
   (defaults: `kilo acp`).
-- A kilo config with an AI provider, e.g. `~/.config/kilo/kilo.jsonc`. You need
-  to set a `small_model` (used by the thinking summarizer; falls back to
-  `kilo/kilo-auto/free`). A minimal providers/models section looks like:
+- A kilo config with an AI provider, e.g. `~/.config/kilo/kilo.jsonc`. A minimal
+  providers/models section looks like:
 
   ```jsonc
   // ~/.config/kilo/kilo.jsonc
@@ -127,9 +125,11 @@ Remove it again with `npm run uninstall:bin`.
 ### Notable environment variables
 
 - `KILO_AGENT_CMD` / `KILO_AGENT_ARGS` — override the spawned agent command.
-- `KILO_THINK_SUMMARY_MODEL` — small model used for thinking summaries
-  (defaults to `kilo/kilo-auto/free`, or the config's `small_model`).
-- `KILO_THINK_SUMMARY_*` — timing/size tuning knobs for the summarizer.
+- `KILO_THINK_DISPLAY_SHORT_GAP` — milliseconds before the first periodic
+  thought display (defaults to `15000`).
+- `KILO_THINK_DISPLAY_GAP_STEP` / `KILO_THINK_DISPLAY_LONG_GAP` — periodic
+  display backoff step and maximum gap in milliseconds (defaults to `10000` /
+  `120000`).
 
 ## Local permissions
 
@@ -270,8 +270,8 @@ if desired, is manual.
 `/status` additionally shows each session's cumulative **cached** (prompt-cache
 read) tokens, summed from the local `kilo.db` message history — the ACP
 `usage_update` notification only reports `used = input + cache.read` with no
-cache split. The cache line appears for the main and summarizer sessions and
-in the compact "previous" rows when a session has cached reads; it is
+cache split. The cache line appears for the main session and in the compact
+"previous" rows when a session has cached reads; it is
 best-effort and silently omitted when `kilo.db` or `node:sqlite` is
 unavailable.
 
@@ -302,10 +302,9 @@ failure clears it (its expired-token case is covered by the `/codex-balance`
 `/compact` compacts the **main** session's context. ACP has no native
 compaction method, so this is a client-side summarize-then-seed: the current
 session is asked for a concise context brief, a new session is started, and the
-brief is sent as its first message. The old session is disposed and the
-thinking-summarizer subagent is restarted. Per-session usage is retained across
-compaction, so `/status` still shows the compacted-away session's tokens and
-cost.
+brief is sent as its first message. The old session is disposed. Per-session
+usage is retained across compaction, so `/status` still shows the
+compacted-away session's tokens and cost.
 
 ## Tests
 
