@@ -210,7 +210,11 @@ the dashboard backend the z.ai `manage-apikey/coding-plan/personal/usage` page
 itself uses (`api.z.ai/api/monitor/usage/quota/limit`, plus a best-effort
 `/biz/subscription/list` for the plan name). It prints the plan/level and the
 percentage left in the rolling 5-hour pool and weekly quota with reset times
-and credits used/total. It is gated to sessions whose model routes through a
+and credits used/total. When the subscription payload carries renewal info it
+also prints a `renews`/`ends` line (`nextRenewTime` when `autoRenew` is on,
+the end of the `valid` range marked "auto-renew off" otherwise); ChatGPT's
+equivalent endpoint exposes no billing date, so `/codex-balance` can't show
+one. It is gated to sessions whose model routes through a
 `zai-coding-plan` / `zai` / `zhipuai` provider, mirroring the codex `openai/`
 gate. The login is a plain API key (no acp token rotation to race), so it
 fetches on demand; only a missing key clears it.

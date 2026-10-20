@@ -16,6 +16,7 @@ GOOSE_DIR="${GOOSE_DIR:-$ROOT/../goose}"
 
 if [ -z "${GOOSE_BIN:-}" ]; then
   for candidate in \
+    "$GOOSE_DIR/target/lean/goose-acp" \
     "$GOOSE_DIR/target/release/goose-acp" \
     "$GOOSE_DIR/target/debug/goose-acp" \
     "$GOOSE_DIR/target/release/goose" \
@@ -29,7 +30,10 @@ fi
 
 if [ -z "${GOOSE_BIN:-}" ]; then
   echo "goose binary not found under $GOOSE_DIR/target" >&2
-  echo "build it first: (cd \"$GOOSE_DIR\" && cargo build --release -p goose --bin goose-acp)" >&2
+  echo "build the standalone ACP agent with rustls first:" >&2
+  echo "  (cd \"$GOOSE_DIR\" && cargo build --release -p goose --bin goose-acp --no-default-features --features rustls-tls,online-model-meta)" >&2
+  echo "or the size-optimized lean profile (slower to link due to fat LTO):" >&2
+  echo "  (cd \"$GOOSE_DIR\" && just build-lean)  # uses native-tls; for rustls run cargo with --profile lean --features rustls-tls,online-model-meta" >&2
   exit 1
 fi
 

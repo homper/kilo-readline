@@ -6,6 +6,7 @@ import { join } from "node:path";
 import {
   parseZaiUsageJson,
   formatZaiUsage,
+  formatZaiDate,
   zaiWindowLabel,
   fetchKiloZaiRemaining,
   handleZaiUsage,
@@ -50,6 +51,9 @@ const SUBSCRIPTION_SAMPLE = {
       productName: "GLM Coding Lite",
       status: "VALID",
       billingCycle: "monthly",
+      autoRenew: 0,
+      nextRenewTime: "2026-10-25",
+      valid: "2026-10-25 22:09:20-2026-11-25 22:09:20",
     },
   ],
   success: true,
@@ -72,6 +76,9 @@ test("parseZaiUsageJson parses the real sample with both windows + plan name", (
   assert.equal(weekly.unit, 6);
   assert.equal(weekly.usedPercent, 59);
   assert.equal(weekly.nextResetMs, 1790950159983);
+  assert.equal(u.renewal?.autoRenew, false);
+  assert.equal(u.renewal?.nextRenewTime, "2026-10-25");
+  assert.equal(u.renewal?.validEnd, "2026-11-25 22:09:20");
 });
 
 test("parseZaiUsageJson tolerates a missing subscription envelope", () => {
@@ -79,6 +86,24 @@ test("parseZaiUsageJson tolerates a missing subscription envelope", () => {
   assert.equal(u.planName, null);
   assert.equal(u.level, "lite");
   assert.equal(u.windows.length, 2);
+  assert.equal(u.renewal, null);
+});
+
+test("parseZaiUsageJson extracts renewal info when auto-renew is on", () => {
+  const u = parseZaiUsageJson(QUOTA_SAMPLE, {
+    data: [{ productName: "GLM Coding Pro", autoRenew: 1, nextRenewTime: "2026-11-01", valid: "2026-10-01-2026-11-01" }],
+  })!;
+  assert.equal(u.renewal?.autoRenew, true);
+  assert.equal(u.renewal?.nextRenewTime, "2026-11-01");
+  assert.equal(u.renewal?.validEnd, "2026-11-01");
+});
+
+test("parseZaiUsageJson tolerates a malformed valid range", () => {
+  const u = parseZaiUsageJson(QUOTA_SAMPLE, {
+    data: [{ autoRenew: 0, valid: "garbage" }],
+  })!;
+  assert.equal(u.renewal?.validEnd, null);
+  assert.equal(u.renewal?.nextRenewTime, null);
 });
 
 test("parseZaiUsageJson returns null when there are no usable windows", () => {
@@ -222,9 +247,39 @@ test("formatZaiUsage renders the real sample", () => {
   assert.match(out, /credits/);
 });
 
+test("formatZaiUsage shows the end date when auto-renew is off", () => {
+  const u = parseZaiUsageJson(QUOTA_SAMPLE, SUBSCRIPTION_SAMPLE)!;
+  const out = strip(formatZaiUsage(u));
+  assert.match(out, /ends\s+: Nov 25( \d{4})? \(auto-renew off\)/);
+});
+
+test("formatZaiUsage shows the renewal date when auto-renew is on", () => {
+  const u = parseZaiUsageJson(QUOTA_SAMPLE, {
+    data: [{ productName: "GLM Coding Pro", autoRenew: 1, nextRenewTime: "2026-11-01" }],
+  })!;
+  const out = strip(formatZaiUsage(u));
+  assert.match(out, /renews\s+: Nov 1( \d{4})?/);
+});
+
+test("formatZaiUsage omits the renewal line when there is no date", () => {
+  const u = parseZaiUsageJson(QUOTA_SAMPLE, {
+    data: [{ productName: "GLM Coding Lite" }],
+  })!;
+  const out = strip(formatZaiUsage(u));
+  assert.doesNotMatch(out, /renews|ends/);
+});
+
+test("formatZaiDate renders month + day, adding the year when it differs", () => {
+  const nowYear = new Date().getFullYear();
+  assert.match(formatZaiDate(`${nowYear}-10-25`), /^Oct 25$/);
+  assert.match(formatZaiDate(`${nowYear}-10-25 22:09:20`), /^Oct 25$/);
+  assert.equal(formatZaiDate(`${nowYear + 1}-01-02`), `Jan 2 ${nowYear + 1}`);
+  assert.equal(formatZaiDate("garbage"), "garbage");
+});
+
 test("formatZaiUsage shows a placeholder when no windows are reported", () => {
   const out = strip(
-    formatZaiUsage({ planName: null, level: null, windows: [] }),
+    formatZaiUsage({ planName: null, level: null, windows: [], renewal: null }),
   );
   assert.match(out, /no usage windows reported/);
 });

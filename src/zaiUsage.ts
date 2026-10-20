@@ -18,8 +18,12 @@
 //   consumed yet, since it resets 5h/7d after first consumption).
 //
 //   GET https://api.z.ai/api/biz/subscription/list
-//     → { code, data: [{ productName:"GLM Coding Lite", ... }] }
-//   Best-effort: only used to label the plan name in the full /zai-balance view.
+//     → { code, data: [{ productName:"GLM Coding Lite", status, billingCycle,
+//          autoRenew, nextRenewTime:"2026-10-25",
+//          valid:"2026-10-25 22:09:20-2026-11-25 22:09:20", ... }] }
+//   Best-effort: used to label the plan name and (when present) the renewal/
+//   end date in the full /zai-balance view. `autoRenew` is 0/1: when off the
+//   plan ends at the end of the `valid` range instead of renewing.
 //
 // Unlike codexUsage.ts there is no OAuth token here to protect: the
 // `zai-coding-plan` entry is a plain API key, so there is no acp token-rotation
@@ -73,6 +77,15 @@ export type ZaiUsage = {
   planName: string | null; // "GLM Coding Lite"
   level: string | null; // "lite" | "pro" | "max"
   windows: ZaiWindow[];
+  renewal: ZaiRenewal | null; // from /biz/subscription/list, best-effort
+};
+
+// Best-effort subscription renewal info from /biz/subscription/list. Fields
+// are raw strings from the API; null when the endpoint failed or lacked them.
+export type ZaiRenewal = {
+  autoRenew: boolean | null; // autoRenew !== 0; null when absent
+  nextRenewTime: string | null; // "2026-10-25" — next billing date when renewing
+  validEnd: string | null; // end of the `valid` range — when the plan ends
 };
 
 // Remaining percent per window, for the live status line.
@@ -138,13 +151,30 @@ export function parseZaiUsageJson(quota: unknown, subscription?: unknown): ZaiUs
   const level = typeof qdata?.level === "string" ? qdata.level : null;
 
   let planName: string | null = null;
+  let renewal: ZaiRenewal | null = null;
   const subsRaw = rec(subscription)?.data;
   const subs = Array.isArray(subsRaw) ? subsRaw : subsRaw == null ? [] : [subsRaw];
   if (subs.length > 0) {
     const first = rec(subs[0]);
     if (first && typeof first.productName === "string") planName = first.productName;
+    if (first) {
+      const autoRenew = num(first.autoRenew);
+      renewal = {
+        autoRenew: autoRenew === null ? null : autoRenew !== 0,
+        nextRenewTime: typeof first.nextRenewTime === "string" ? first.nextRenewTime : null,
+        validEnd: parseValidEnd(typeof first.valid === "string" ? first.valid : null),
+      };
+    }
   }
-  return { planName, level, windows };
+  return { planName, level, windows, renewal };
+}
+
+// The `valid` field is a dash-joined range like
+// "2026-10-25 22:09:20-2026-11-25 22:09:20"; return just the end bound.
+function parseValidEnd(valid: string | null): string | null {
+  if (!valid) return null;
+  const m = /^(\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2}:\d{2})?)-(\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2}:\d{2})?)$/.exec(valid.trim());
+  return m ? m[2] : null;
 }
 
 // --- auth ---
@@ -262,6 +292,20 @@ export async function fetchKiloZaiRemaining(
 
 // --- format ---
 
+// "2026-10-25" / "2026-10-25 22:09:20" → "Oct 25" (+" 2026" when the year is
+// not the current one). Returns the raw string when it doesn't parse.
+const ZAI_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+export function formatZaiDate(raw: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(raw.trim());
+  if (!m) return raw;
+  const year = Number(m[1]);
+  const mon = ZAI_MONTHS[Number(m[2]) - 1];
+  if (!mon) return raw;
+  const day = Number(m[3]);
+  const nowYear = new Date().getFullYear();
+  return year === nowYear ? `${mon} ${day}` : `${mon} ${day} ${year}`;
+}
+
 // Human label for a window's span, derived from its unit + count.
 export function zaiWindowLabel(unit: number, number: number): string {
   if (unit === 3) return `${number}h`; // hours
@@ -295,6 +339,22 @@ export function formatZaiUsage(u: ZaiUsage): string {
         ? `${u.planName} (${u.level})`
         : (u.planName ?? u.level);
     lines.push(`  ${C.dim}plan${C.reset}    : ${plan}`);
+  }
+  const r = u.renewal;
+  if (r) {
+    if (r.autoRenew === false) {
+      const end = r.validEnd ?? r.nextRenewTime;
+      if (end) {
+        lines.push(
+          `  ${C.dim}ends${C.reset}    : ${formatZaiDate(end)} ${C.dim}(auto-renew off)${C.reset}`,
+        );
+      }
+    } else {
+      const renew = r.nextRenewTime ?? r.validEnd;
+      if (renew) {
+        lines.push(`  ${C.dim}renews${C.reset}  : ${formatZaiDate(renew)}`);
+      }
+    }
   }
   for (const w of u.windows) {
     lines.push(formatWindowRow(zaiWindowLabel(w.unit, w.number), w));
