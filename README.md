@@ -131,6 +131,61 @@ Remove it again with `npm run uninstall:bin`.
   display backoff step and maximum gap in milliseconds (defaults to `10000` /
   `120000`).
 
+## Privacy-oriented configuration
+
+The client always sets the following environment variables on the spawned
+`kilo acp` process:
+
+```text
+KILO_PURE=1
+DO_NOT_TRACK=1
+```
+
+These disable Kilo telemetry initialization and the automatic initialization
+of remote-control and indexing integrations. They apply to the child Kilo
+process only; they do not disable this client's provider usage checks. Kilo's
+model-catalog refreshes and automatic update checks remain enabled.
+
+For an OpenAI-only setup, merge the following into the global
+`~/.config/kilo/kilo.jsonc` or project-local `.kilo/kilo.jsonc`. Replace the
+model with the OpenAI model approved for the account:
+
+```jsonc
+{
+  "model": "openai/gpt-5.6-sol",
+  "small_model": "openai/gpt-5.6-sol",
+  "enabled_providers": ["openai"],
+  "share": "disabled",
+  "remote_control": false,
+  "experimental": {
+    "openTelemetry": false
+  },
+  "permission": {
+    "webfetch": "ask",
+    "websearch": "ask",
+    "repo_clone": "ask"
+  }
+}
+```
+
+Remove non-OpenAI credentials from Kilo's authentication store as well.
+`enabled_providers` restricts model selection, but this client still checks
+supported providers found in the authentication store for quota information.
+The OpenAI-only provider configuration also prevents sessions from qualifying
+for Kilo Gateway's personal free-model session export.
+
+With this configuration, prompts and any file contents, diffs, terminal output,
+or tool results selected for model context are still sent to OpenAI. Sessions
+and tool results are also retained locally by Kilo, primarily in
+`~/.local/share/kilo/kilo.db`, while submitted prompts are retained in
+`.kilo/history`.
+
+The client also contacts
+`https://chatgpt.com/backend-api/wham/usage` for automatic Codex quota updates.
+That request includes the OpenAI OAuth token and account ID, but not prompts or
+repository contents. Approved shell commands and any explicitly enabled MCP,
+plugin, skill, or network tools remain independent outbound paths.
+
 ## Local permissions
 
 When a permission prompt is shown, the client adds an extra option beyond the

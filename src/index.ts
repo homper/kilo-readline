@@ -1851,6 +1851,8 @@ const NO_ARG_COMMANDS = new Set([...COMMANDS.filter((c) => !PAGED_COMMANDS.has(c
 function buildAgentEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   env.LOG_LEVEL = "debug";
+  env.KILO_PURE = "1";
+  env.DO_NOT_TRACK = "1";
 
   // Compute the non-permission config (provider, model, agent, etc.) from
   // the user's real global + local configs, plus the ask/deny permission
