@@ -148,13 +148,29 @@ model-catalog refreshes and automatic update checks remain enabled.
 
 For an OpenAI-only setup, merge the following into the global
 `~/.config/kilo/kilo.jsonc` or project-local `.kilo/kilo.jsonc`. Replace the
-model with the OpenAI model approved for the account:
+model with the OpenAI model approved for the account. The default, small, and
+agent-specific model assignments are all required to prevent Kilo from using
+its own models for utility, compaction, summary, title, or delegated-agent
+operations:
 
 ```jsonc
 {
   "model": "openai/gpt-5.6-sol",
   "small_model": "openai/gpt-5.6-sol",
   "enabled_providers": ["openai"],
+  "agent": {
+    "build": { "model": "openai/gpt-5.6-sol" },
+    "code": { "model": "openai/gpt-5.6-sol" },
+    "plan": { "model": "openai/gpt-5.6-sol" },
+    "general": { "model": "openai/gpt-5.6-sol" },
+    "explore": { "model": "openai/gpt-5.6-sol" },
+    "debug": { "model": "openai/gpt-5.6-sol" },
+    "orchestrator": { "model": "openai/gpt-5.6-sol" },
+    "ask": { "model": "openai/gpt-5.6-sol" },
+    "compaction": { "model": "openai/gpt-5.6-sol" },
+    "summary": { "model": "openai/gpt-5.6-sol" },
+    "title": { "model": "openai/gpt-5.6-sol" }
+  },
   "share": "disabled",
   "remote_control": false,
   "experimental": {
