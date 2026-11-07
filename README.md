@@ -149,27 +149,43 @@ model-catalog refreshes and automatic update checks remain enabled.
 For an OpenAI-only setup, merge the following into the global
 `~/.config/kilo/kilo.jsonc` or project-local `.kilo/kilo.jsonc`. Replace the
 model with the OpenAI model approved for the account. The default, small, and
-agent-specific model assignments are all required to prevent Kilo from using
-its own models for utility, compaction, summary, title, or delegated-agent
-operations:
+agent-specific assignments explicitly pin every currently defined model path;
+`enabled_providers` is the final safeguard preventing Kilo models from being
+selected:
 
 ```jsonc
 {
   "model": "openai/gpt-5.6-sol",
   "small_model": "openai/gpt-5.6-sol",
   "enabled_providers": ["openai"],
+  "default_agent": "code",
   "agent": {
-    "build": { "model": "openai/gpt-5.6-sol" },
+    // USED WITH kilo-readline: normal ACP primary agent and explicit default above.
     "code": { "model": "openai/gpt-5.6-sol" },
-    "plan": { "model": "openai/gpt-5.6-sol" },
-    "general": { "model": "openai/gpt-5.6-sol" },
-    "explore": { "model": "openai/gpt-5.6-sol" },
-    "debug": { "model": "openai/gpt-5.6-sol" },
-    "orchestrator": { "model": "openai/gpt-5.6-sol" },
-    "ask": { "model": "openai/gpt-5.6-sol" },
+    // USED WITH kilo-readline: automatically titles a session after its first prompt.
+    "title": { "model": "openai/gpt-5.6-sol" },
+
+    // CONDITIONALLY USED WITH kilo-readline: automatic compaction near the ~1M-token limit.
+    // Sessions are normally kept around 200k-300k tokens, then /compact is run or a
+    // summary is saved under .kilo/, so automatic compaction is not expected to run.
     "compaction": { "model": "openai/gpt-5.6-sol" },
-    "summary": { "model": "openai/gpt-5.6-sol" },
-    "title": { "model": "openai/gpt-5.6-sol" }
+
+    // NOT USED WITH kilo-readline: legacy alias remapped to code, not a separate agent.
+    "build": { "model": "openai/gpt-5.6-sol" },
+    // NOT USED WITH kilo-readline's current UI: ACP primary mode with no mode switch here.
+    "plan": { "model": "openai/gpt-5.6-sol" },
+    // NOT USED WITH kilo-readline: ACP subagent requires the denied task tool.
+    "general": { "model": "openai/gpt-5.6-sol" },
+    // NOT USED WITH kilo-readline: ACP subagent requires the denied task tool.
+    "explore": { "model": "openai/gpt-5.6-sol" },
+    // NOT USED WITH kilo-readline's current UI: ACP primary mode with no mode switch here.
+    "debug": { "model": "openai/gpt-5.6-sol" },
+    // NOT USED WITH kilo-readline's current UI: deprecated mode; task is also denied.
+    "orchestrator": { "model": "openai/gpt-5.6-sol" },
+    // NOT USED WITH kilo-readline's current UI: ACP primary mode with no mode switch here.
+    "ask": { "model": "openai/gpt-5.6-sol" },
+    // NOT USED WITH kilo-readline: no active call exists in the audited ACP flow.
+    "summary": { "model": "openai/gpt-5.6-sol" }
   },
   "share": "disabled",
   "remote_control": false,
