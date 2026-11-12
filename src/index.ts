@@ -717,6 +717,7 @@ const ASK_PERMISSION: Record<string, string> = {
   websearch: "ask",
   external_directory: "ask",
   todowrite: "ask",
+  skill: "ask",
   lsp: "ask",
   codebase_search: "ask",
   repo_clone: "ask",
@@ -726,7 +727,6 @@ const DISABLE_PERMISSION: Record<string, string> = {
   suggest: "deny",
   question: "deny",
   task: "deny",
-  skill: "deny",
   recall: "deny",
   kilo_local_recall: "deny",
 };
